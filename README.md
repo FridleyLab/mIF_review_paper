@@ -30,7 +30,12 @@ Segmentation outputs (cell tables, label masks, cell outlines and the analyzed r
 **Analysis:**
 
 1. Clone the tagged release.
-2. In R (≥ 4.4), run `renv::restore()`.
+2. In R (≥ 4.4), install the two GitHub packages at the commits used:
+   ```r
+   remotes::install_github("JiangmeiRubyXiong/cfGMM@47b5b6f8b6cecb05aa6bca66972e793d8b32cd86")
+   remotes::install_github("JiangmeiRubyXiong/GammaGateR@72f59d55b8558f7f3bb4230347749951f629ed12")
+   ```
+   Install the other packages loaded in the `setup` chunk from CRAN and Bioconductor (FlowSOM). Versions used are listed in `analysis/session_info.txt`.
 3. Open `analysis/mIF_comparative_study.Rmd` and run all chunks.
 
 The Rmd reads `stardist.txt` and `watershed.txt` directly from the Zenodo record, so no download is needed. It writes the seven figure panels and `agreement_tables.csv` to its own folder. The mask overlays in FIG. 3b come from QuPath, not the Rmd.
