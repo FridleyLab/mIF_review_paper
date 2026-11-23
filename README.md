@@ -1,9 +1,8 @@
 # Comparative case study: processing of multiplexed immunofluorescence tissue images
 
-Code to reproduce the comparative case study (FIG. 3 and FIG. 4) in Sabitov et al., "Processing of multiplexed immunofluorescence tissue images", *Nature Reviews Methods Primers* ([year]).
+Code to reproduce the comparative case study (FIG. 3 and FIG. 4) in Sabitov et al., "Processing of multiplexed immunofluorescence tissue images".
 
-Code archive: [code DOI]
-Data: [10.5281/zenodo.24454389](https://doi.org/10.5281/zenodo.24454389)
+Data: https://doi.org/10.5281/zenodo.24454389
 
 ## Source image
 
@@ -18,7 +17,6 @@ qupath/
   dsb2018_heavy_augment.pb        StarDist model (from qupath/models)
 analysis/
   mIF_comparative_study.Rmd       full analysis
-  mIF_comparative_study.html      rendered output of the submitted run
   renv.lock                       R package versions
 results/                          figure panels and agreement table from the submitted run
 ```
@@ -27,7 +25,7 @@ Segmentation outputs (cell tables, label masks, cell outlines and the analyzed r
 
 ## Reproducing
 
-**Segmentation** (optional, outputs already on Zenodo): in QuPath [version], open the source image, import the annotation from either GeoJSON on Zenodo, copy the model file into the project folder, and run each script in `qupath/`. Both segment nuclei on DAPI and expand them to cells, by 3 µm (StarDist) and 5 µm (watershed).
+**Segmentation** (optional, outputs already on Zenodo): in QuPath 0.6.0 open the source image, import the annotation from either GeoJSON on Zenodo, copy the model file into the project folder, and run each script in `qupath/`. Both segment nuclei on DAPI and expand them to cells, by 3 µm (StarDist) and 5 µm (watershed).
 
 **Analysis:**
 
