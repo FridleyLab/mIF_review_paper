@@ -1,0 +1,353 @@
+---
+title: "mIF comparative case study"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(mgcv)
+library(RANN)
+library(spdep)
+library(FlowSOM)
+library(GammaGateR)   # devtools::install_github("JiangmeiRubyXiong/GammaGateR")
+library(ggplot2)
+library(scales)
+library(ragg)
+
+set.seed(1)
+
+# Folder holding the two QuPath exports
+options(timeout = 2400) 
+input_dir <- "https://zenodo.org/records/24454389/files"
+```
+
+# Segmentation
+
+```{r segmentation}
+# The two exports name their columns differently, so pull the shared fields by name
+read_seg <- function(file, method) {
+  d <- fread(file.path(input_dir, file), sep = "\t")
+  col <- \(stain) d[[grep(paste0("^Cell: ", stain, ":? [Mm]ean$"), names(d))]]
+  data.table(method = method,
+             X = d[["Centroid X µm"]], Y = d[["Centroid Y µm"]],
+             DAPI = col("DAPI"), CD3 = col("CD3e"), CD8 = col("CD8"), CD68 = col("CD68"))
+}
+
+cells <- rbind(read_seg("stardist.txt", "StarDist"),
+               read_seg("watershed.txt", "Watershed"))
+cells[, id := seq_len(.N), by = method]
+
+# Mutual nearest neighbours within 5 px count as the same cell in both segmentations
+match_cells <- function(a, b, tol = 5) {
+  ab <- nn2(as.matrix(b[, .(X, Y)]), as.matrix(a[, .(X, Y)]), k = 1)
+  ba <- nn2(as.matrix(a[, .(X, Y)]), as.matrix(b[, .(X, Y)]), k = 1)
+  j <- ab$nn.idx[, 1]
+  keep <- ba$nn.idx[j, 1] == seq_len(nrow(a)) & ab$nn.dists[, 1] <= tol
+  data.table(id_a = a$id[keep], id_b = b$id[j[keep]])
+}
+matched <- match_cells(cells[method == "StarDist"], cells[method == "Watershed"])
+
+cells[, .N, by = method]
+nrow(matched)
+```
+
+# Normalization
+
+```{r normalization}
+markers <- c("CD3", "CD8", "CD68")
+
+# Log-mean division, per segmentation
+cells[, paste0("lm_", markers) := lapply(.SD, \(x) log10(1 + x / mean(x, na.rm = TRUE))),
+      by = method, .SDcols = markers]
+
+# Bivariate GAM: residual of log intensity after a DAPI smooth and a spatial smooth
+cells[, log_DAPI := log1p(DAPI)]
+for (m in markers) {
+  f <- as.formula(paste0("log1p(", m, ") ~ s(log_DAPI, k = 10) + s(X, Y, k = 30)"))
+  cells[, paste0("gam_", m) := as.numeric(residuals(
+    gam(f, data = .SD, method = "REML", na.action = na.exclude))), by = method]
+}
+
+# Spatial autocorrelation (Moran's I, 6 nearest neighbours) on StarDist cells
+sd_cells <- na.omit(cells[method == "StarDist"])
+lw <- nb2listw(knn2nb(knearneigh(as.matrix(sd_cells[, .(X, Y)]), k = 6)), style = "W")
+moran <- rbindlist(lapply(markers, \(m) data.table(
+  marker = m,
+  Raw = moran.test(log1p(sd_cells[[m]]), lw)$estimate[[1]],
+  `Log-mean` = moran.test(sd_cells[[paste0("lm_", m)]], lw)$estimate[[1]],
+  GAM = moran.test(sd_cells[[paste0("gam_", m)]], lw)$estimate[[1]])))
+rm(sd_cells, lw)
+
+moran
+```
+
+# Phenotyping
+
+```{r phenotyping}
+# FlowSOM metacluster -> marker positivity, read off the printed metacluster means:
+# StarDist: 1 negative, 2 CD68+, 3 CD3+CD8+, 4 CD3+CD8-
+# watershed: 1 negative, 2 CD68+, 3 CD3+CD8-, 4 CD3+CD8+
+map_sd <- data.table(CD3 = c(0, 0, 1, 1), CD8 = c(0, 0, 1, 0), CD68 = c(0, 1, 0, 0))
+map_ws <- data.table(CD3 = c(0, 0, 1, 1), CD8 = c(0, 0, 0, 1), CD68 = c(0, 1, 0, 0))
+
+flowsom_calls <- function(x, map) {
+  cl <- as.integer(as.character(GetMetaclusters(
+    FlowSOM(as.matrix(x), colsToUse = 1:3, nClus = 4, seed = 42))))
+  means <- apply(x, 2, \(v) tapply(v, cl, mean))
+  print(table(cl)); print(round(means, 3))
+  # stop if a positive metacluster is not above every negative one for its marker
+  for (j in seq_along(markers)) {
+    pos <- map[[j]] == 1
+    if (min(means[pos, j]) <= max(means[!pos, j]))
+      stop("Metacluster map does not match the means for ", markers[j])
+  }
+  map[cl]
+}
+
+# GammaGateR with mode bounds on the log-mean scale
+# (row 1 = unexpressed, row 2 = expressed; order CD3, CD8, CD68)
+ggr_bounds <- list(
+  CD3  = matrix(c(0, 0.3, 0.5, 1),   nrow = 2, byrow = TRUE),
+  CD8  = matrix(c(0, 0.2, 0.3, Inf), nrow = 2, byrow = TRUE),
+  CD68 = matrix(c(0, 0.2, 0.3, Inf), nrow = 2, byrow = TRUE)
+)
+
+gammagater_calls <- function(x) {
+  fit <- groupGammaGateR(as.data.frame(x), slide = rep(1, nrow(x)), boundaryMarkers = ggr_bounds)
+  convCheck(fit)
+  # posterior > 0.5 = positive; a failed fit (NA) would show in convCheck
+  as.data.table(lapply(fit[[1]]$expressionZ, \(p) as.integer(p > 0.5 & !is.na(p)))) |>
+    setNames(markers)
+}
+
+sd_lm  <- cells[method == "StarDist"][complete.cases(lm_CD3, lm_CD8, lm_CD68)]
+ws_gam <- cells[method == "Watershed"][complete.cases(gam_CD3, gam_CD8, gam_CD68)]
+
+# One row per cell: GammaGateR and FlowSOM on StarDist/log-mean, FlowSOM on watershed/GAM
+calls <- list(
+  ggr  = gammagater_calls(sd_lm[, .(lm_CD3, lm_CD8, lm_CD68)])[, id := sd_lm$id],
+  fsom = flowsom_calls(sd_lm[, .(lm_CD3, lm_CD8, lm_CD68)], map_sd)[, id := sd_lm$id],
+  ws   = flowsom_calls(ws_gam[, .(gam_CD3, gam_CD8, gam_CD68)], map_ws)[, id := ws_gam$id]
+)
+rm(sd_lm, ws_gam)
+
+# Agreement between two sets of calls on the same cells (a vs b)
+agreement <- function(a, b) {
+  rbindlist(lapply(markers, \(m) data.table(
+    marker = m,
+    a_only = sum(a[[m]] == 1 & b[[m]] == 0), both = sum(a[[m]] == 1 & b[[m]] == 1),
+    b_only = sum(a[[m]] == 0 & b[[m]] == 1),
+    expected_both = sum(a[[m]]) * sum(b[[m]]) / length(a[[m]]))))[
+      , jaccard := both / (a_only + both + b_only)]
+}
+
+# Count and percent positive per marker
+n_pos <- \(d) sapply(markers, \(m) sum(d[[m]]))
+prev <- data.table(marker = markers,
+                   p1 = 100 * n_pos(calls$ggr) / nrow(calls$ggr),
+                   fsom = 100 * n_pos(calls$fsom) / nrow(calls$fsom),
+                   p2 = 100 * n_pos(calls$ws) / nrow(calls$ws))
+```
+
+```{r comparisons}
+# Single step: GammaGateR (a) vs FlowSOM (b) on the same StarDist/log-mean cells
+single <- agreement(calls$ggr, calls$fsom)
+
+# End to end: pipeline 1 (a) vs pipeline 2 (b) on cells matched between segmentations
+matched_e2e <- match_cells(cells[method == "StarDist"][id %in% calls$ggr$id],
+                           cells[method == "Watershed"][id %in% calls$ws$id])
+e2e <- agreement(calls$ggr[match(matched_e2e$id_a, id)], calls$ws[match(matched_e2e$id_b, id)])
+
+# Fold changes along pipeline 2 -> FlowSOM on StarDist/log-mean -> pipeline 1
+# (>1 = higher toward pipeline 1)
+prev[, `:=`(upstream = fsom / p2, pheno = p1 / fsom, total = p1 / p2)]
+
+single; e2e; prev
+fwrite(rbindlist(list(`single step` = single, `end to end` = e2e), idcol = "comparison"),
+       "agreement_tables.csv")
+```
+
+```{r checks}
+# Values the run should still reproduce (unaffected by the FlowSOM relabelling)
+data.table(
+  quantity = c("StarDist cells", "Watershed cells", "Matched cells",
+               paste("GammaGateR", markers, "positive"), "Single step CD8 Jaccard"),
+  published = c(99731, 49276, 45842, 14758, 5732, 2719, 0.794),
+  computed  = c(cells[, .N, by = method]$N, nrow(matched), n_pos(calls$ggr),
+                round(single[marker == "CD8", jaccard], 3))
+)[, diff := computed - published][]
+
+# Sanity: FlowSOM CD8 calls are a subset of its CD3 calls; prevalences are in (0, 100)
+stopifnot(n_pos(calls$fsom)[["CD8"]] <= n_pos(calls$fsom)[["CD3"]],
+          n_pos(calls$ws)[["CD8"]]   <= n_pos(calls$ws)[["CD3"]],
+          all(as.matrix(prev[, .(p1, fsom, p2)]) > 0),
+          all(as.matrix(prev[, .(p1, fsom, p2)]) < 100))
+```
+
+# Figures
+
+```{r style}
+# Shared style: 7 pt Arial, 0.3 mm lines; one PNG per panel at print size (mm)
+col <- c(StarDist = "#0072B2", Watershed = "#E69F00",
+         "Log-Mean Division" = "#0072B2", "Bivariate GAM" = "#E69F00",
+         "GammaGateR only" = "#0072B2", "FlowSOM only" = "#E69F00",
+         "Pipeline 1" = "#0072B2", "Pipeline 2" = "#E69F00",
+         "Pipeline 1 only" = "#0072B2", "Pipeline 2 only" = "#E69F00", Both = "#4D4D4D")
+pt <- 7 / .pt
+theme_fig <- theme_classic(base_size = 7, base_family = "Arial", base_line_size = 0.3) +
+  theme(text = element_text(colour = "black"), axis.text = element_text(colour = "black"),
+        legend.text = element_text(colour = "black"),
+        strip.background = element_blank(), strip.text = element_text(face = "bold"),
+        legend.title = element_blank(), legend.key.size = unit(3, "mm"),
+        legend.position = "bottom", legend.box.spacing = unit(1, "mm"),
+        panel.spacing = unit(3, "mm"), plot.margin = margin(2, 4, 2, 2))
+
+save_fig <- function(p, name, w, h) {
+  ggsave(name, p, width = w, height = h, units = "mm",
+         dpi = 600, device = agg_png)
+  p
+}
+
+# Horizontal 100% bars with the Jaccard index, used for FIG. 3d and 4c
+agreement_bars <- function(d, lab_a, lab_b, xlab) {
+  d |>
+    mutate(either = a_only + both + b_only,
+           ylab = factor(sprintf("%s\n(n = %s)", marker, comma(either)), levels = rev(sprintf("%s\n(n = %s)", marker, comma(either)))),
+           jlab = if_else(jaccard < 0.001, "J < 0.001", sprintf("J = %.3f", jaccard))) |>
+    pivot_longer(c(a_only, both, b_only), names_to = "cat", values_to = "n") |>
+    mutate(cat = factor(recode(cat, a_only = lab_a, both = "Both", b_only = lab_b),
+                        levels = c(lab_b, "Both", lab_a))) |>
+    ggplot(aes(n / either, ylab, fill = cat)) +
+    geom_col(width = 0.6, colour = "black", linewidth = 0.3) +
+    geom_text(data = \(x) distinct(x, ylab, jlab), aes(1.015, ylab, label = jlab),
+              inherit.aes = FALSE, hjust = 0, size = pt, family = "Arial") +
+    scale_fill_manual(values = col, breaks = c(lab_a, "Both", lab_b)) +
+    scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.25), oob = oob_keep,
+                       labels = c(0, 25, 50, 75, 100), expand = expansion(0)) +
+    coord_cartesian(clip = "off") +
+    labs(x = xlab, y = NULL) + theme_fig +
+    theme(plot.margin = margin(2, 14, 2, 2, unit = "mm"))
+}
+```
+
+```{r fig3b, fig.width = 105/25.4, fig.height = 80/25.4}
+# FIG. 3b: raw intensities by segmentation method
+n_lab <- cells[, .N, by = method][, setNames(sprintf("%s (n = %s)", method, comma(N)), method)]
+p <- cells |>
+  melt(id.vars = "method", measure.vars = c("DAPI", markers), variable.name = "marker") |>
+  filter(is.finite(value), value >= 0) |>
+  ggplot(aes(value, colour = method, fill = method)) +
+  geom_density(alpha = 0.25, linewidth = 0.4) +
+  facet_wrap(~ marker, ncol = 2, scales = "free_y", axes = "all_x", axis.labels = "margins") +
+  scale_x_continuous(trans = "log1p", breaks = c(0, 1, 10, 100)) +
+  scale_colour_manual(values = col, labels = n_lab, aesthetics = c("colour", "fill")) +
+  labs(x = "Raw intensity (log scale)", y = "Density") + theme_fig
+save_fig(p, "fig3b_densities.png", 105, 80)
+```
+
+```{r fig3b-match, fig.width = 72/25.4, fig.height = 16/25.4}
+# FIG. 3b: matching bar under the mask images
+n_seg <- cells[, .N, by = method]$N
+p <- data.table(cat = factor(c("StarDist only", "Matched", "Watershed only"), levels = c("StarDist only", "Matched", "Watershed only")),
+           n = c(n_seg[1] - nrow(matched), nrow(matched), n_seg[2] - nrow(matched)))[
+  , `:=`(xmax = cumsum(n) / sum(n), xmin = shift(cumsum(n) / sum(n), fill = 0))] |>
+  ggplot() +
+  geom_rect(aes(xmin = xmin, xmax = xmax, ymin = 0.35, ymax = 0.65, fill = cat), colour = "black", linewidth = 0.3) +
+  geom_text(data = \(d) filter(d, cat != "Watershed only"), aes((xmin + xmax) / 2, 0.5, label = paste(cat, comma(n))),
+            colour = "white", size = pt, family = "Arial") +
+  geom_text(data = \(d) filter(d, cat == "Watershed only"), aes(xmax, 0.2, label = paste(cat, comma(n))),
+            hjust = 1, size = pt, family = "Arial") +
+  annotate("text", x = 0, y = 0.8, hjust = 0, size = pt, family = "Arial",
+           label = sprintf("Matched: %.0f%% of StarDist, %.0f%% of watershed cells",
+                           100 * nrow(matched) / n_seg[1], 100 * nrow(matched) / n_seg[2])) +
+  scale_fill_manual(values = c("StarDist only" = "#0072B2", Matched = "#4D4D4D", "Watershed only" = "#E69F00")) +
+  scale_x_continuous(expand = expansion(0)) + scale_y_continuous(limits = c(0.05, 0.95), expand = expansion(0)) +
+  coord_cartesian(clip = "off") + theme_void(base_family = "Arial") + theme(legend.position = "none")
+save_fig(p, "fig3b_match.png", 72, 16)
+```
+
+```{r fig3c, fig.width = 180/25.4, fig.height = 50/25.4}
+# FIG. 3c: normalized intensities on StarDist cells, with Moran's I per marker
+p <- cells[method == "StarDist"] |>
+  melt(id.vars = "id", measure.vars = c(paste0("lm_", markers), paste0("gam_", markers))) |>
+  separate(variable, c("norm", "marker")) |>
+  mutate(norm = factor(if_else(norm == "gam", "Bivariate GAM", "Log-Mean Division"),
+                       levels = c("Log-Mean Division", "Bivariate GAM")),
+         marker = factor(marker, levels = markers)) |>
+  filter(is.finite(value)) |>
+  ggplot(aes(value, colour = norm, fill = norm)) +
+  geom_density(alpha = 0.25, linewidth = 0.4) +
+  geom_text(data = moran[, .(marker = factor(marker, levels = markers),
+                             lab = sprintf("Moran's I:\nRaw %.2f\nLog-Mean Division %.2f\nBivariate GAM %.2f", Raw, `Log-mean`, GAM))],
+            aes(3, Inf, label = lab), inherit.aes = FALSE,
+            hjust = 1, vjust = 1.1, lineheight = 0.95, size = pt, family = "Arial") +
+  facet_wrap(~ marker, nrow = 1, scales = "free_y") +
+  coord_cartesian(xlim = c(-2, 3)) +
+  scale_colour_manual(values = col, aesthetics = c("colour", "fill")) +
+  labs(x = "Normalized intensity", y = "Density") + theme_fig
+save_fig(p, "fig3c_normalized.png", 180, 50)
+```
+
+```{r fig3d, fig.width = 180/25.4, fig.height = 38/25.4}
+# FIG. 3d: GammaGateR vs FlowSOM
+agreement_bars(single, "GammaGateR only", "FlowSOM only", "% of cells positive under either method") |>
+  save_fig("fig3d_agreement.png", 180, 38)
+```
+
+```{r fig4b, fig.width = 80/25.4, fig.height = 120/25.4}
+# FIG. 4b: prevalence under each pipeline, fold difference labelled
+p <- prev |>
+  melt(id.vars = "marker", measure.vars = c("p1", "p2"), variable.name = "pipeline", value.name = "pct") |>
+  mutate(pipeline = if_else(pipeline == "p1", "Pipeline 1", "Pipeline 2"),
+         marker = factor(marker, levels = markers)) |>
+  group_by(marker) |> mutate(fold = max(pct) / min(pct), gmean = sqrt(prod(pct))) |> ungroup() |>
+  ggplot(aes(marker, pct)) +
+  geom_line(aes(group = marker), colour = "#BFBFBF", linewidth = 0.8) +
+  geom_point(aes(fill = pipeline), shape = 21, size = 2.5, stroke = 0.3) +
+  geom_text(data = \(d) distinct(d, marker, fold, gmean), aes(y = gmean, label = sprintf("%.1f\u00d7", fold)),
+            nudge_x = 0.12, hjust = 0, fontface = "bold", size = pt, family = "Arial") +
+  scale_fill_manual(values = col) +
+  scale_y_log10(limits = range(prev[, .(p1, p2)]) * c(0.6, 1.6),
+                breaks = c(0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100), labels = label_number(drop0trailing = TRUE)) +
+  labs(x = NULL, y = "% positive cells (log scale)") + theme_fig +
+  theme(legend.text = element_text(size = 8)) +
+  guides(fill = guide_legend(override.aes = list(size = 3)))
+save_fig(p, "fig4b_prevalence.png", 80, 120)
+```
+
+```{r fig4c, fig.width = 90/25.4, fig.height = 38/25.4}
+# FIG. 4c: end-to-end agreement on matched cells
+agreement_bars(e2e, "Pipeline 1 only", "Pipeline 2 only", "% of matched cells positive under either pipeline") |>
+  save_fig("fig4c_agreement.png", 90, 38)
+```
+
+```{r fig4d, fig.width = 90/25.4, fig.height = 57/25.4}
+# FIG. 4d: where the change arose; right of 1x = higher under pipeline 1
+steps <- c(upstream = "Segmentation + normalization", pheno = "Phenotyping", total = "Total")
+# symmetric log axis wide enough for the largest fold plus its label
+k <- ceiling(log2(max(unlist(prev[, .(upstream, pheno, total)]), 1 / unlist(prev[, .(upstream, pheno, total)])))) + 1
+p <- prev |>
+  melt(id.vars = "marker", measure.vars = names(steps), variable.name = "step", value.name = "ratio") |>
+  mutate(step = factor(steps[as.character(step)], levels = steps),
+         y = match(marker, c("CD68", "CD8", "CD3")) + c(0.26, 0, -0.26)[as.integer(step)],
+         up = ratio >= 1) |>
+  ggplot() +
+  geom_vline(xintercept = 1, linewidth = 0.3) +
+  geom_rect(aes(xmin = 1, xmax = ratio, ymin = y - 0.11, ymax = y + 0.11, fill = step), colour = "black", linewidth = 0.3) +
+  geom_text(aes(x = if_else(up, ratio * 1.08, ratio / 1.08), y = y, hjust = if_else(up, 0, 1),
+                label = sprintf("%.1f\u00d7", pmax(ratio, 1 / ratio))), size = pt, family = "Arial") +
+  annotate("text", x = 2^c(-k, k), y = 3.68, hjust = c(0, 1), size = pt, family = "Arial",
+           label = c("\u2190 pipeline 2 higher", "pipeline 1 higher \u2192")) +
+  scale_fill_manual(values = c("#009E73", "#CC79A7", "white")) +
+  scale_x_log10(limits = 2^c(-k, k), breaks = 2^(-k:k), expand = expansion(0),
+                labels = paste0(2^abs(-k:k), "\u00d7")) +
+  scale_y_continuous(breaks = 1:3, labels = c("CD68", "CD8", "CD3"), limits = c(0.6, 3.8), expand = expansion(0)) +
+  coord_cartesian(clip = "off") + guides(fill = guide_legend(nrow = 1)) +
+  labs(x = "Fold difference in % positive (log scale)", y = NULL) +
+  theme_fig + theme(axis.ticks.y = element_blank())
+save_fig(p, "fig4d_attribution.png", 90, 57)
+```
