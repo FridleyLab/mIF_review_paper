@@ -51,8 +51,6 @@ The `checks` chunk should show `diff = 0` for every row:
 | GammaGateR CD3+ / CD8+ / CD68+ | 14,758 / 5,732 / 2,719 |
 | Single-step CD8 Jaccard | 0.794 |
 
-Figures and tables from the submitted run are in `results/` for comparison.
-
 FlowSOM metaclusters are labeled from their printed means. If a different FlowSOM version renumbers them, the run stops with an error, and the maps at the top of the `phenotyping` chunk need updating.
 
 ## License
