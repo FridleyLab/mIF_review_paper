@@ -17,8 +17,7 @@ qupath/
   dsb2018_heavy_augment.pb        StarDist model (from qupath/models)
 analysis/
   mIF_comparative_study.Rmd       full analysis
-  renv.lock                       R package versions
-results/                          figure panels and agreement table from the submitted run
+  session_info.txt                R environment details and package versions
 ```
 
 Segmentation outputs (cell tables, label masks, cell outlines and the analyzed region) are on Zenodo, not here.
